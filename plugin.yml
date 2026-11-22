@@ -1,0 +1,167 @@
+# One declaration file for the whole plugin. `deploy.mjs` at the repository
+# root reads every plugins/*/plugin.yml and installs them together.
+id: longcat-worker
+title: LongCat worker pool
+description: |
+  An opt-in delegation surface: the main model (glm / deepseek / qwen) stays the
+  engineer and foreman, and mechanical labour goes to a fresh child on
+  LongCat-2.5-Preview via the `longcat_worker` tool. DSH's own delegation rows
+  are deliberately left alone, so nothing changes unless the user asks for
+  LongCat in that conversation (see the bundled skill).
+
+  Installed pieces:
+    - the `longcat_worker` tool row (pinned route, worker persona, recursion guard)
+    - an `llm-pi-ai` route table, injected ONLY into a profile that does not
+      already own one, because a loader patch replaces a row's whole config
+    - every skills/*/SKILL.md below this folder, exposed at the default user
+      skill root through a directory junction
+
+# Top-level patch entries this plugin contributes. deploy.mjs splices these into
+# each profile's cordis.patch.yml inside its single generated block.
+#
+# Ownership rule (no per-entry flags needed): an entry is SKIPPED for a profile
+# that already owns a row with one of its ids outside the block. That is what
+# keeps the desktop profile's hand-written llm-pi-ai table authoritative while
+# the web profile still gets the route it would otherwise be missing.
+patch: |
+  # ── pi-ai route table (only spliced into a profile that does NOT already own an
+  #    `llm-pi-ai` row of its own) ────────────────────────────────────────────────
+  # A worker pinned to provider `longcat` needs that provider registered. The desktop
+  # profile declares its route table by hand in cordis.patch.yml, so this fragment is
+  # left out there. The web profile never declared one — it inherited its routes from
+  # `$DSH_HOME/settings.yaml`, and that file no longer exists — so without this row the
+  # worker tool would mount and then fail every spawn with an unknown-route error.
+  #
+  # The provider set below mirrors the desktop profile's hand-written row exactly
+  # (longcat + glm + zai), so both profiles resolve the same models. A `llm-pi-ai:`
+  # section in settings.yaml still overrides all of this at runtime, so anything the
+  # user later saves in the Models page keeps winning.
+  - id: llm-pi-ai
+    name: '@deepseek-ai/dsh-llm-pi-ai'
+    config:
+      providers:
+        longcat:
+          displayName: LongCat
+          apiKeyEnv: LONGCAT_KEY_1
+          api: openai-completions
+          baseURL: https://api.longcat.chat/openai/v1
+          models:
+            - id: LongCat-2.5-Preview
+              name: LongCat 2.5 Preview
+              contextWindow: 1048576
+              maxTokens: 262144
+              input:
+                - text
+            - id: LongCat-2.0
+              name: LongCat 2.0
+              contextWindow: 1048576
+              maxTokens: 131072
+              input:
+                - text
+        glm:
+          displayName: glm-5.3-flash
+          apiKeyEnv: GLM_API_KEY
+          api: openai-completions
+          baseURL: https://open.bigmodel.cn/api/paas/v4
+          models:
+            - id: glm-5.3-flash
+              name: glm-5.3-flash
+        zai:
+          models:
+            - id: GLM-4.7
+              name: GLM-4.7
+          baseURL: https://open.bigmodel.cn/api/paas/v4
+          apiKeyEnv: ZAI_API_KEY
+
+  # ── LongCat worker tool ───────────────────────────────────────────────────────
+  # ONE tool, ONE route: every call starts a fresh child on LongCat-2.5-Preview.
+  # The supervisor stays on whatever model the user picked (glm / deepseek / qwen).
+  #
+  # This row is ADDITIVE. It deliberately does not touch `subagent`, `subagent_fork`,
+  # the workflow engine, `ralph`, or the Agent Teams rows, so DSH's own delegation
+  # defaults keep inheriting the parent model exactly as shipped. LongCat is opt-in
+  # per conversation, through the `longcat-worker-dispatch` skill.
+  #
+  # ONE tool rather than one-per-role: a worker is a fresh child that sees nothing of
+  # the parent conversation, so the DISPATCHING PROMPT is what makes it a researcher,
+  # a builder or a reviewer — roles belong to the assignment. Parallelism comes from
+  # calling this same tool several times with `run_in_background: true`, which costs
+  # one tool schema instead of five.
+  - insert:
+      - id: longcat-worker
+        name: '@deepseek-ai/dsh-tool-subagent'
+        config:
+          provider: spawn
+          toolName: longcat_worker
+          backgroundMode: one-shot
+          maxDepth: 1
+          # Pinned route. `longcat` is the apiKeyEnv: LONGCAT_KEY_1 provider declared
+          # above; LongCat-2.5-Preview is a REASONING model and that reasoning is
+          # billed against maxTokens, so a small cap yields an EMPTY final message
+          # (measured). 65536 is generous on purpose; the ceiling is 262144.
+          agentOptions:
+            provider: longcat
+            model: LongCat-2.5-Preview
+            maxTokens: 65536
+          # Agent preset. 这个 DSH 版本**删掉了 tool 行上的 `persona` 和
+          # `toolFilter` 两个字段** —— 写了就直接抛
+          # "tool-subagent: persona is no longer supported"，整行挂载失败，
+          # 工具等于不存在（实测：longcat-worker / rb-lc25 / rb-lc20 三条全挂）。
+          # 现在 persona 挂在 preset 里的 @deepseek-ai/dsh-persona 行上，
+          # 用 agentPreset 选中。递归由 maxDepth: 1 兜住（不再靠 toolFilter）。
+          agentPreset: delegated-worker
+          allowedAgentPresets: [ delegated-worker ]
+
+  # ── 共享 preset：所有「派工型」子代理共用 ───────────────────────────────────
+  # 为什么共享：longcat-worker / rb-lc25 / rb-lc20 三条工具的 worker 契约是同
+  # 一份东西（看不见父对话、只干指派的那件事、不许再派工、按固定格式汇报）。
+  # 分成三份只会让以后改契约时要改三处、漏一处。
+  #
+  # ⚠ 这个 preset **不是默认**。默认 preset 是 shipped 的 `standard`；
+  # 这里只是让三条工具能选到它。工具本身也不会被自动调用 ——
+  # 由 longcat-worker-dispatch 技能（disable-model-invocation: true）在用户
+  # 点名时才启用。
+  - insert:
+    - id: preset-delegated-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: delegated-worker
+        order: 50
+        plugins:
+          - id: delegated-worker-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                You are a DELEGATED WORKER. A supervising engineer assigned you exactly
+                one unit of work. You cannot see their conversation, so the assignment in
+                front of you is everything you know; the supervisor is the only one who
+                talks to the human.
+  
+                How to behave:
+                - Do exactly the assignment and nothing else. No side quests, no
+                  refactors, no "while I was there" edits, no files outside the ones named.
+                - The supervisor has already decided the approach. Do not redesign it, do
+                  not substitute a method you prefer, and do not stop to ask whether a
+                  better plan exists. If the assignment is genuinely impossible or
+                  contradicts itself, stop and report that instead of inventing a workaround.
+                - Take the literal path: the exact file, the exact command, the exact
+                  format named in the assignment. If a detail is missing, use the smallest
+                  reasonable reading and SAY SO in your report instead of expanding the task.
+                - Read a file before you edit it. Keep every edit targeted and minimal.
+                - Use tools, do not guess: read, run, then report what actually happened.
+                  Never state a result you did not observe. If you could not verify
+                  something, write UNVERIFIED next to it, verbatim.
+                - You may NOT delegate. Never call longcat_worker, rb_lc25, rb_lc20,
+                  rb_ds, subagent, subagent_fork, workflow, ralph, spawn_teammate, or any
+                  other agent-starting tool. You are the end of the chain; if the work
+                  seems to need another agent, say so and stop.
+                - If you hit a wall, stop and report the exact blocker: the command, the
+                  error text, and what you tried. Do not retry the same thing forever, and
+                  do not fill the gap with plausible-looking output.
+  
+                Finish with a SHORT, evidence-first report in exactly this shape:
+                STATUS: done | blocked | partial
+                WHAT I DID: <=5 lines
+                EVIDENCE: exact paths + exact commands + real output excerpts (or UNVERIFIED)
+                OPEN: anything unfinished, uncertain, or outside the assignment
+  
